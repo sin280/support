@@ -556,6 +556,69 @@
 
 ---
 
+## 事前確認チェックリスト（実環境で作業を始める前に潰しておくべき「手詰まり」要因）
+
+Flutter 本体の差分以外にも、特に**社内 JFrog・プロキシ制限環境**や**ローカル開発ツールのバージョン**に起因して作業途中で進めなくなる典型的なポイントがあります。実環境に入る前に以下の4領域を確認・準備しておくと手詰まりを防げます。
+
+### 1. 社内 JFrog・ネットワーク制限まわりのブロック要因（最重要）
+
+- **[ ] ① Flutter SDK 本体（`v3.47.8`）の入手経路（`flutter upgrade` の GitHub 通信罠）**
+  - `flutter upgrade` コマンド自体は `PUB_HOSTED_URL`（JFrog）を見に行かず、`github.com/flutter/flutter.git` へ直接 `git fetch` を実行します。
+  - GitHub へのアクセスが遮断されており、社内 JFrog 等に置かれた SDK アーカイブ（`flutter_macos_3.47.8-stable.zip` / `flutter_windows_3.47.8-stable.zip`）を展開して切り替える運用の場合は、**作業開始前に `v3.47.8` の SDK zip が社内リポジトリへ配置済みか**を最初に確認してください。
+- **[ ] ② Flutter エンジン・アーティファクトの取得先（`FLUTTER_STORAGE_BASE_URL` / Maven）**
+  - SDK を `v3.47.8` に切り替えた初回実行時に、`storage.googleapis.com`（または `FLUTTER_STORAGE_BASE_URL` で指定した JFrog ミラー）から **Dart SDK 本体・iOS/Android エンジンバイナリ** を取得します。
+  - また Android ビルド時には `download.flutter.io` から `io.flutter:flutter_embedding_*` 等の Maven アーティファクトを取得します。これらが JFrog のリモートキャッシュ経由で `v3.47.8` 分も自動取得される構成か確認してください。
+- **[ ] ③ Android `settings.gradle` の `FAIL_ON_PROJECT_REPOS` 設定と JFrog Maven 競合**
+  - 社内規約で `settings.gradle` に `repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)` を設定して JFrog 以外の参照を厳格に弾いている場合、Flutter Gradle プラグインや更新後のサードパーティプラグインがプロジェクト直下にリポジトリを追加しようとしてビルドエラーになることがあります（`PREFER_SETTINGS` の利用や `FLUTTER_STORAGE_BASE_URL` 設定との整合確認が必要）。
+- **[ ] ④ Gradle Wrapper（`gradle-wrapper.properties`）の `distributionUrl` 直書き罠**
+  - フェーズ3で AGP 9.0+ に上げる場合、**Gradle `9.1.0` 以上**が必要になります。このとき公式サンプルどおり `https\://services.gradle.org/distributions/gradle-9.1.0-all.zip` と書いてしまうと、社内ファイアウォールで遮断されてビルドが止まります。
+  - 必ず既存の `android/gradle/wrapper/gradle-wrapper.properties` が指している**社内 JFrog 上の Gradle 配布 URL 形式に合わせ、JFrog 側に該当バージョンの Gradle zip が配置されているか**を確認してください（無ければ無理に AGP 9 へ上げず、フェーズ1の AGP 8 系のまま完了させる判断が安全です）。
+- **[ ] ⑤ CocoaPods + JFrog（`cocoapods-art`）の `Podfile` 編集ミスと新規 Pod キャッシュ漏れ**
+  - `ios/Podfile` の `platform :ios, '15.0'` を書き換える際、上部にある `plugin 'cocoapods-art', :sources => [...]` 等の社内 JFrog 向け設定を誤って消さないよう注意してください。また、Flutter プラグイン更新に伴って要求される新しいバージョンのネイティブ Pod（Firebase 系等）が JFrog リモートリポジトリでブロックされずキャッシュ可能かも確認ポイントです。
+- **[ ] ⑥ Dart Build Hooks（旧 Native Assets：`hook/build.dart`）の外部直接通信**
+  - Dart 3.10〜3.13 で普及した Build Hooks 対応パッケージ（`sqlite3`、`objective_c`、`jni`、一部の暗号・FFI 系パッケージの新バージョン）に更新すると、ビルド中に裏で `hook/build.dart` が走り、**`PUB_HOSTED_URL`（JFrog）を通らずに GitHub Releases（`github.com/.../releases/download/...`）へ直接プリビルドバイナリを取りに行ってタイムアウトする**ケースがあります。
+  - `flutter pub upgrade` 後に特定のパッケージが原因でネットワークエラーが出た場合は、`pubspec.lock` に `hooks` や `code_assets` が増えていないか確認し、該当パッケージのみ旧バージョンに固定（ピン留め）して回避してください。
+- **[ ] ⑦ 社内プロキシの SSL インスペクション（自己署名ルート証明書）**
+  - `v3.47.8` では内蔵 BoringSSL の更新が入っています。社内プロキシで通信の SSL 復号・再署名を行っている場合、OS の証明書ストア（Windows 証明書マネージャ / macOS キーチェーン）や環境変数に社内 CA 証明書が正しく登録されているか確認してください。
+
+### 2. 開発マシン・CI 環境のローカルツール要件（情シス権限・事前導入が必要なもの）
+
+- **[x] ① Xcode バージョン（※準備済み）**
+  - `v3.44` 以降で **Xcode 15 以上必須（Xcode 16 以上推奨、App Store 提出を行う場合は Xcode 26 以上必須）**。（※CI ランナー等に Intel Mac が残っていないかだけ念のため留意）
+- **[x] ② CocoaPods（Ruby Gem）のバージョン `1.16.2` 以上（※準備済み）**
+  - 新しい Xcode の `project.pbxproj`（`objectVersion = 70` 等）に対応済み。
+- **[x] ③ Java（JDK）バージョン JDK 17 または JDK 21（※準備済み）**
+  - ※実行時にターミナルの `JAVA_HOME` や Android Studio の Gradle JDK 設定が古い JDK を指していないことだけ確認。
+- **[ ] ④ Android SDK / NDK バージョン（Google Play の 16KB ページサイズ要件）と古い Gradle 記述**
+  - Google Play への提出がある場合、`compileSdk 35`（以上）に加えて **16KB メモリページサイズ対応のため NDK `r28` 以上（および AGP `8.5.1` 以上）** が求められます。SDK Manager から NDK r28+ を社内ネットワーク越しに取得できるか確認してください。
+  - また、プロジェクトが古く `android/app/build.gradle` や `settings.gradle` に命令的な `apply from: ".../app_plugin_loader.gradle"` が残っている場合は、宣言的な `plugins { id "dev.flutter.flutter-plugin-loader" version "1.0.0" }` 形式への書き換えが必要です。
+- **[ ] ⑤ 社内 EDR / ウイルス対策ソフト（Windows Smart App Control 等）による新 SDK バイナリ検疫**
+  - 特に Windows 端末では、新しく展開した `v3.47.8` の `dart.exe` / `impellerc.exe` や `build_runner` が生成する一時バイナリが社内 EDR にスキャン・ブロックされてビルドが極端に遅くなる／失敗する事象があります（除外フォルダ指定のルールがあれば要確認）。
+
+### 3. パッケージ依存解決・コード生成の「Dart 3世代ジャンプ（3.10 → 3.13）」問題
+
+- **[ ] ① `flutter_localizations` と `intl` パッケージのバージョン固定衝突（超高頻度）**
+  - 多言語対応や日付フォーマットで `flutter_localizations`（SDK 同梱）を使っている場合、Flutter SDK 側が特定の `intl` バージョンを強く指定します。
+  - `pubspec.yaml` に `intl: ^0.19.0` のように明示バージョンを書いていると、SDK 更新直後の `flutter pub get` が衝突エラーで止まります。**`intl: any`** に変更して SDK 側のバージョン指定に追従させるのが最も安全です（他パッケージが古い `intl` を要求して衝突する場合は一時的に `dependency_overrides` で回避）。
+- **[ ] ② `build_runner` / `freezed` / `json_serializable` / `retrofit_generator` 等のメジャー上限**
+  - 同梱 Dart が `3.10.7` → `3.13.7` へ上がることで、内部の `analyzer` や `dart_style` のバージョンが大きく上がります。
+  - `pubspec.yaml` でコード生成系パッケージのメジャーバージョンが古いまま固定されていると、`flutter pub upgrade` 時に `version solving failed`（依存解決エラー）で止まりやすいです。必要に応じて `dev_dependencies` のメジャーバージョン引き上げ（`flutter pub upgrade --major-versions`）と、`dart run build_runner build --delete-conflicting-outputs` による `.g.dart` / `.freezed.dart` の全面再生成を見込んでおいてください。
+- **[ ] ③ `custom_lint` / `riverpod_lint` のプラグイン方式変更**
+  - Dart 3.10〜3.13 で公式の `analysis_server_plugin` への移行が進み、`v3.47.2` で旧来の `analyzer_plugin` が非推奨化されました（例：`riverpod_lint` v3 系では `custom_lint` が不要になり `analysis_options.yaml` の記述方法も変更）。古い `custom_lint` を入れたままだと `flutter analyze` や IDE の解析サーバーがフリーズ・クラッシュすることがあるため、利用している場合は最新版の移行ガイドに合わせて `analysis_options.yaml` を更新してください。
+
+### 4. ビルドは通るが「実行時・画面表示」で壊れやすいアプリ機能の重点確認ポイント
+
+- **[ ] ① Android 15 / 16（`targetSdk 35 / 36`）連動による「Edge-to-Edge 強制化」の画面上下被り**
+  - `android/app/build.gradle` で `targetSdkVersion flutter.targetSdkVersion` を指定していると、Flutter を `v3.47.8` へ上げた瞬間に自動的に `targetSdk` も 35/36 世代へ引き上がります。
+  - これにより Android 15/16 の仕様で **画面が強制的に Edge-to-Edge（ステータスバーおよび画面下部のナビゲーションバーの裏側まで描画が広がる仕様、Android 16 ではオプトアウト不可・`setStatusBarColor` 無効）** になります。標準の `AppBar` を使っていない独自ヘッダーや、画面下部に配置した固定ボタンに `SafeArea`（または `MediaQuery.paddingOf(context)`）がないと、**ボタンがシステムナビゲーションバーと重なって押せなくなるレイアウト崩れ**が起きます。
+- **[ ] ② iOS `UIScene` 化に伴う「ディープリンク / OAuth ログイン復帰 / Universal Links」の無反応化**
+  - Full Flutter アプリで最も見落としやすい実行時バグです。外部ブラウザを使った SSO / OAuth 認証（カスタム URL スキーム復帰）、決済アプリ連携、Universal Links を利用している場合、`UIScene` 有効化後はイベント通知先が `AppDelegate` から **`SceneDelegate`（`FlutterSceneDelegate`）** に変わります。
+  - 古いリンク系プラグイン（メンテナンス終了した `uni_links` 等 → `app_links` への移行推奨）を使っていたり、`AppDelegate` に独自処理を書いていると、**「ビルドは通るのにログイン後にアプリへ戻っても画面が切り替わらない（特にアプリ終了状態からのコールドスタート時）」** という事象が起きるため、テスト項目に必ず入れてください。
+- **[ ] ③ `pubspec.yaml` の SDK 制約（`environment:`）の更新**
+  - プロジェクト自身の `pubspec.yaml` にある `environment: sdk:` が古い範囲のままだと新しい言語機能やパッケージ解決の妨げになるため、アップデート時に `sdk: ^3.13.0`（または `'>=3.13.0 <4.0.0'`）へ引き上げてください。
+
+---
+
 ## 推奨アップグレード手順（Full Flutter アプリ向け：最速・最安全ルート）
 
 ### 基本方針：「SDK は一気に `v3.47.8` へ上げ、設定変更をフェーズ1〜4に分割する」
