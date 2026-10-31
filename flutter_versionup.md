@@ -556,35 +556,114 @@
 
 ---
 
-## 推奨アップグレード手順（v3.38.6 → v3.47.8）
+## 推奨アップグレード手順（Full Flutter アプリ向け：最速・最安全ルート）
 
-1. **Flutter SDK の更新**
+### 基本方針：「SDK は一気に `v3.47.8` へ上げ、設定変更をフェーズ1〜4に分割する」
+
+Full Flutter アプリを `v3.38.6` から最新へ上げる場合、途中のマイナーバージョン（`3.41` / `3.44`）を順番に踏むとパッケージ互換パズルや複数回のビルド検証でかえって手戻りが発生します。
+一方で、すべての変更を一度に適用するとビルドエラーの原因切り分けが困難になり、修復不能な状態に陥るリスクがあります。
+
+そのため、**「Flutter SDK 自体は一気に `v3.47.8` へ上げつつ、ビルドシステムの変更をフラグでロックしてフェーズごとに1つずつ解放・Gitコミットする」**手順を採用します。
+
+> **【重要前提：社内 JFrog 利用（SwiftPM 未対応）環境について】**
+> - `v3.44.0` 以降はデフォルトで Swift Package Manager (SwiftPM) が有効になり、何もしないままビルドを実行すると `ios/Runner.xcodeproj` が自動的に SwiftPM 用へ書き換えられ、外部（GitHub 等）への直接通信を試みて JFrog 環境下でビルド不能になります。
+> - これを防ぐため、**必ず SDK 更新・ビルド実行【前】に `pubspec.yaml` で `enable-swift-package-manager: false` を明示設定し、今回のアップデートでは一貫して従来の CocoaPods（JFrog 経由）を維持**します（`v3.47.8` でも CocoaPods ビルドは公式に完全動作します）。
+
+---
+
+### フェーズ1：新ビルド機構をオフに固定し、最小限の必須対応だけで `v3.47.8` を起動させる
+
+まずは「SwiftPM」と「Android Built-in Kotlin」を従来構成にロックした状態で、SDK 更新と必須の破壊的変更のみに対応し、アプリがビルド・起動するベースラインを作ります。
+
+1. **作業ブランチの作成とビルド機構の事前ロック（※必ず `flutter upgrade` / `build` 前に実施）**
+   - **SwiftPM の無効化（JFrog 環境のため恒久設定）**: `pubspec.yaml` の `flutter:` セクション配下に以下を追加する（CLI コマンドではなく `pubspec.yaml` に書くことで、チーム全員・CI 環境に強制適用される）。
+     ```yaml
+     flutter:
+       config:
+         enable-swift-package-manager: false
+     ```
+   - **Android Built-in Kotlin の一時無効化**: `android/gradle.properties` に以下を一時追加する。
+     ```properties
+     android.builtInKotlin=false
+     android.newDsl=false
+     ```
+2. **Flutter SDK と依存パッケージの更新**
    ```bash
    flutter channel stable
-   flutter upgrade
-   ```
-2. **依存パッケージの互換性確認・更新**
-   - SwiftPM・UIScene・AGP 9 / Built-in Kotlin 対応のため、ネイティブプラグインを含むパッケージを可能な限り最新化する。
-   ```bash
+   flutter upgrade        # v3.47.8 (Dart 3.13.7) へ更新
    flutter pub outdated
-   flutter pub upgrade
+   flutter pub upgrade    # 社内 JFrog ミラー経由でパッケージ更新
    ```
-3. **自動コードマイグレーションの適用**
-   - `describeEnum` → `.name`、`containsSemantics` → `isSemantics`、`cacheExtent` → `scrollCacheExtent` などの機械的置換を自動適用する。
+3. **コンパイルエラーになる必須の Dart コード修正のみ実施**
+   - `describeEnum(xxx)` を使用している箇所を `xxx.name` へ置換する。
+   - `IconData` を継承・実装（`extends` / `implements IconData`）している独自クラスがあればラッパークラスへ変更する。
+   - `CupertinoPageTransitionsBuilder` を使用しているファイルに `import 'package:flutter/cupertino.dart';` を追加する。
+4. **iOS / macOS 最小 OS バージョンの引き上げと `UIScene` 対応**
+   - **iOS 15.0 引き上げ**: `ios/Podfile` の `platform :ios, '15.0'`（および `post_install` 内の `IPHONEOS_DEPLOYMENT_TARGET`）、`ios/Runner.xcodeproj/project.pbxproj` の `IPHONEOS_DEPLOYMENT_TARGET = 15.0`、`ios/Flutter/AppFrameworkInfo.plist` の `MinimumOSVersion`（`15.0`）を更新する。
+   - **macOS 12.0 引き上げ**（macOS ターゲットがある場合）: `macos/Podfile` と `MACOSX_DEPLOYMENT_TARGET` を `12.0` に更新する。
+   - **iOS `UIScene` 対応**:
+     - `AppDelegate`・`Info.plist` が未編集の標準状態であれば、ビルド時に自動マイグレーションされるため手動作業は不要。
+     - カスタマイズしている場合は、`Info.plist` への `UIApplicationSceneManifest` 追加、および `AppDelegate` の `FlutterImplicitEngineDelegate`（`didInitializeImplicitFlutterEngine`）への移行を行う。
+5. **クリーンビルド＆実機・シミュレータ起動確認**
    ```bash
-   dart fix --dry-run
-   dart fix --apply
+   flutter clean
+   flutter pub get
+   cd ios && pod install && cd ..   # JFrog の CocoaPods リポジトリ経由で通ることを確認
+   flutter run                      # iOS / Android 両方で起動確認
    ```
-4. **手動確認が必要なコード・設定のチェック**
-   - `ListView.separated` / `SliverList.separated` の `findChildIndexCallback` → `findItemIndexCallback`（`* 2` の削除）
-   - `ReorderableListView` 等の `onReorder` → `onReorderItem`（`if (oldIndex < newIndex) newIndex -= 1;` の削除）
-   - `Semantics(header: true)` → `Semantics(headingLevel: 1)` への置換
-   - `CupertinoPageTransitionsBuilder` 利用箇所への `import 'package:flutter/cupertino.dart';` 追加
-   - `IconData` を継承・実装しているカスタムクラスがないかの確認
-   - `ios/Podfile`・Xcode の最小ターゲット `iOS 15.0` 引き上げ、およびカスタム `AppDelegate` がある場合の `UIScene`（`FlutterImplicitEngineDelegate`）対応
-   - `macos/Podfile`・Xcode の最小ターゲット `macOS 12.0` 引き上げ
-5. **静的解析・テスト・実機ビルド確認**
+   - **チェックポイント**: 両 OS でアプリが起動することを確認したら、**ここで必ず1回目の Git コミットを作成する**（以降で問題が起きてもいつでもこの動く状態に戻せる）。
+
+---
+
+### フェーズ2：iOS / macOS 依存管理の確定（JFrog / CocoaPods 運用の検証と将来対応メモ）
+
+通常の環境ではここで SwiftPM を有効化しますが、**社内 JFrog が SwiftPM 未対応の環境では、フェーズ1で設定した `enable-swift-package-manager: false` を外さずにそのまま維持（確定）**します。
+
+1. **SwiftPM が誤って有効化されていないことの確認**
+   - `ios/Runner.xcodeproj/project.pbxproj` の `git diff` を確認し、`FlutterGeneratedPluginSwiftPackage` などの SwiftPM 参照が混入していないことを確認する。
+   - ※万が一、`pubspec.yaml` 設定前にビルドを実行して Xcode プロジェクトが書き換わり壊れてしまった場合は、`git checkout -- ios/` で一度戻してからフェーズ1の順序でやり直すだけでクリーンに復旧できる。
+2. **中長期のインフラ検討メモ（2026年12月以降に向けた注意点）**
+   - 今回の `v3.47.8` アップデートおよび当面のビルドは CocoaPods のままで 100% 問題なく稼働する。
+   - ただし、**2026年12月2日に CocoaPods 公式中央リポジトリ（Trunk）が読み取り専用（Read-Only）に移行**するため、2027年以降にリリースされる新しいバージョンの iOS ネイティブ SDK（Firebase 等）や Flutter プラグインは順次 CocoaPods サポートを終了し SwiftPM 専用へ移行していく。
+   - 次回以降の大型アップデートに備え、別タスクとして社内インフラ部門へ **JFrog Artifactory での SwiftPM（Swift Package Registry）リポジトリ対応** を相談・依頼しておくと安全。
+
+---
+
+### フェーズ3：Android の Built-in Kotlin / AGP 9 対応への移行
+
+iOS とアプリ本体が安定している状態で、Android の Gradle / Kotlin 設定だけを単独でモダン化します。
+
+1. **Android Gradle 設定の更新**
+   - Kotlin Gradle Plugin (KGP) バージョンが `2.0.0` 以上になっていることを確認する。
+   - AGP 9.0 以上を使用する場合は、`android/app/build.gradle(.kts)` からレガシーな `id("kotlin-android")` / `id("org.jetbrains.kotlin.android")` 指定を削除し、JVM ターゲット指定を `kotlin { compilerOptions { ... } }` 記法へ移行したうえで、フェーズ1で一時追加した `android/gradle.properties` の `android.builtInKotlin=false` / `android.newDsl=false` を削除（または `true` に変更）する。
+2. **Android ビルド（Debug および Release AAB/APK）の検証**
+   ```bash
+   flutter build apk --debug
+   flutter build appbundle --release
+   ```
+   - **ロールバック基準**: もし社内 JFrog 上の AGP / Gradle プラグインミラーバージョンや、未対応のサードパーティプラグインが原因でエラーになる場合は、無理に AGP 9 へ上げずフェーズ1の設定（AGP 8系 + `android.builtInKotlin=false`）に戻して進めても `v3.47.8` では問題なく動作する。
+   - 確認できたら **ここで2回目の Git コミットを作成する**。
+
+---
+
+### フェーズ4：非推奨（Deprecated）API・動作変更の解消と最終テスト
+
+最後に、ビルドシステムが完全に固まった安全な状態で Dart コードの品質改善と動作変更チェックを行います。
+
+1. **`dart fix` による機械的置換の一括適用**
+   ```bash
+   dart fix --dry-run   # 変更差分の事前確認
+   dart fix --apply     # 自動修正の適用（containsSemantics → isSemantics、cacheExtent → scrollCacheExtent 等）
+   ```
+2. **手動確認が必須なロジック・UI 変更箇所の洗い出しと修正**
+   - **`ListView.separated` / `SliverList.separated`**: `findChildIndexCallback` を `findItemIndexCallback` に変更し、インデックス計算の **`* 2` を必ず削除**する。
+   - **`ReorderableListView` / `ReorderableList` / `SliverReorderableList`**: `onReorder` を `onReorderItem` に変更し、**`if (oldIndex < newIndex) newIndex -= 1;` の手動補正を必ず削除**する。
+   - **`Semantics(header: true)`**: コンパイルエラーにならないまま iOS / Android で見出し認識が無効化されているため、プロジェクト内を全文検索して **`Semantics(headingLevel: 1)`** 等へ書き換える。
+   - **色付き `Container` / `ColoredBox` 直下の `ListTile`**: デバッグ実行時に画面を遷移して `FlutterError` が出ないか確認し、該当箇所があれば `ListTile(tileColor: ...)` または `Material` ラップへ修正する。
+   - **Material 3 生成色 / バリアブルフォント**: シードカラー（`onPrimaryContainer` 等）や可変フォントの太さに意図しない見た目変化がないか主要画面を目視確認する。
+3. **静的解析・テストの実行と完了コミット**
    ```bash
    flutter analyze
    flutter test
    ```
+   - すべての解析とテストがパスしたことを確認し、**最終コミットを作成してアップデート完了**。
